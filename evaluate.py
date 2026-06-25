@@ -14,9 +14,11 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
 from tqdm import tqdm
+import mlflow
 
 from dataset import HairTypeDataset, get_val_transforms, CLASS_NAMES
 from model import create_model
+from mlflow_config import setup_tracking, get_or_create_experiment, log_evaluation_artifacts
 
 
 def parse_args():
@@ -25,6 +27,7 @@ def parse_args():
     p.add_argument("--checkpoint", type=str, default="./checkpoints/best_model.pth", help="Model checkpoint")
     p.add_argument("--batch_size", type=int, default=32, help="Batch size")
     p.add_argument("--output_dir", type=str, default="./checkpoints", help="Where to save reports")
+    p.add_argument("--run_id", type=str, default=None, help="MLflow run ID to log evaluation under (optional)")
     return p.parse_args()
 
 
@@ -49,6 +52,11 @@ def gather_predictions(model, loader, device):
 def main():
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ── MLflow setup ─────────────────────────────────────────────────────────
+
+    setup_tracking()
+    get_or_create_experiment()
 
     # ── Load checkpoint ──────────────────────────────────────────────────────
 
@@ -80,6 +88,8 @@ def main():
     print("  Classification Report")
     print("=" * 60)
     report = classification_report(y_true, y_pred, target_names=class_names, digits=3)
+    report_dict = classification_report(y_true, y_pred, target_names=class_names,
+                                        digits=4, output_dict=True)
     print(report)
 
     # Save text report
@@ -102,7 +112,47 @@ def main():
     cm_path = os.path.join(args.output_dir, "confusion_matrix.png")
     plt.savefig(cm_path, dpi=150)
     plt.close()
-    print(f"  📊 Confusion matrix saved to {cm_path}\n")
+    print(f"  📊 Confusion matrix saved to {cm_path}")
+
+    # ── Log to MLflow ────────────────────────────────────────────────────────
+
+    # If a training run_id was provided, log under that run; otherwise start a new one
+    run_kwargs = {}
+    if args.run_id:
+        run_kwargs["run_id"] = args.run_id
+        print(f"\n  📊 Logging evaluation to existing MLflow run: {args.run_id}")
+    else:
+        run_kwargs["run_name"] = "evaluation"
+        print(f"\n  📊 Logging evaluation to new MLflow run")
+
+    with mlflow.start_run(**run_kwargs):
+        # Log overall metrics
+        overall_acc = report_dict["accuracy"]
+        mlflow.log_metric("eval_accuracy", overall_acc)
+        mlflow.log_metric("eval_macro_f1", report_dict["macro avg"]["f1-score"])
+        mlflow.log_metric("eval_weighted_f1", report_dict["weighted avg"]["f1-score"])
+
+        # Log per-class metrics
+        for cls_name in class_names:
+            if cls_name in report_dict:
+                for metric_name in ["precision", "recall", "f1-score"]:
+                    key = f"eval_{cls_name.lower()}_{metric_name.replace('-', '_')}"
+                    mlflow.log_metric(key, report_dict[cls_name][metric_name])
+
+        # Log evaluation params
+        mlflow.log_params({
+            "eval_checkpoint": args.checkpoint,
+            "eval_dataset_size": len(dataset),
+        })
+
+        # Tag as evaluation run
+        mlflow.set_tag("run_type", "evaluation")
+
+        # Log artifacts
+        log_evaluation_artifacts(args.output_dir)
+
+        print(f"  ✓ Evaluation metrics logged to MLflow")
+        print(f"  Overall accuracy: {overall_acc:.2%}\n")
 
 
 if __name__ == "__main__":

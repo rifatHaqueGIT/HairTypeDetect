@@ -17,9 +17,14 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+import mlflow
 
 from dataset import HairTypeDataset, get_train_transforms, get_val_transforms, CLASS_NAMES
 from model import create_model, unfreeze_backbone, count_parameters
+from mlflow_config import (
+    setup_tracking, get_or_create_experiment,
+    log_dataset_info, log_model_info, log_epoch_metrics, log_training_artifacts,
+)
 
 
 # ── CLI Arguments ────────────────────────────────────────────────────────────
@@ -132,11 +137,17 @@ def main():
     print(f"  LR     : {args.lr}")
     print(f"{'='*60}\n")
 
+    # ── MLflow setup ─────────────────────────────────────────────────────────
+
+    setup_tracking()
+    get_or_create_experiment()
+
     # ── Data ─────────────────────────────────────────────────────────────────
 
     print("Loading dataset …")
     full_dataset = HairTypeDataset(args.data_dir, transform=None)  # transforms applied later
-    print(f"  Class distribution: {full_dataset.class_distribution()}\n")
+    class_dist = full_dataset.class_distribution()
+    print(f"  Class distribution: {class_dist}\n")
 
     # Train / val split
     n_val = int(len(full_dataset) * args.val_split)
@@ -172,63 +183,102 @@ def main():
     optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    # ── Training loop ────────────────────────────────────────────────────────
+    # ── Training loop (wrapped in MLflow run) ────────────────────────────────
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
-    history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
-    best_val_loss = float("inf")
-    patience_counter = 0
+    with mlflow.start_run() as run:
+        print(f"  🔬 MLflow run: {run.info.run_id}\n")
 
-    for epoch in range(1, args.epochs + 1):
-        print(f"Epoch {epoch}/{args.epochs}")
+        # Log parameters
+        mlflow.log_params({
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "learning_rate": args.lr,
+            "val_split": args.val_split,
+            "patience": args.patience,
+            "seed": args.seed,
+            "device": str(device),
+        })
+        log_dataset_info(class_dist, len(full_dataset), args.val_split)
+        log_model_info("EfficientNet-B0", info["trainable"], info["total"], freeze)
 
-        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, val_acc = validate(model, val_loader, criterion, device)
-        scheduler.step()
+        # Tag the run
+        mlflow.set_tags({
+            "model_type": "EfficientNet-B0",
+            "backbone_frozen": str(freeze),
+            "dataset_dir": args.data_dir,
+        })
 
-        history["train_loss"].append(train_loss)
-        history["val_loss"].append(val_loss)
-        history["train_acc"].append(train_acc)
-        history["val_acc"].append(val_acc)
+        history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
+        best_val_loss = float("inf")
+        patience_counter = 0
 
-        lr_now = scheduler.get_last_lr()[0]
-        print(f"  Loss: {train_loss:.4f} / {val_loss:.4f}  |  "
-              f"Acc: {train_acc:.2%} / {val_acc:.2%}  |  LR: {lr_now:.6f}")
+        for epoch in range(1, args.epochs + 1):
+            print(f"Epoch {epoch}/{args.epochs}")
 
-        # ── Checkpoint best model ────────────────────────────────────────────
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0
-            ckpt_path = os.path.join(args.checkpoint_dir, "best_model.pth")
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "val_loss": val_loss,
-                "val_acc": val_acc,
-                "class_names": CLASS_NAMES,
-            }, ckpt_path)
-            print(f"  ✓ Saved best model (val_loss={val_loss:.4f})")
-        else:
-            patience_counter += 1
-            if patience_counter >= args.patience:
-                print(f"\n  ⏹ Early stopping triggered (patience={args.patience})")
-                break
+            train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
+            val_loss, val_acc = validate(model, val_loader, criterion, device)
+            scheduler.step()
 
-        print()
+            history["train_loss"].append(train_loss)
+            history["val_loss"].append(val_loss)
+            history["train_acc"].append(train_acc)
+            history["val_acc"].append(val_acc)
 
-    # ── Save curves & history ────────────────────────────────────────────────
+            lr_now = scheduler.get_last_lr()[0]
+            print(f"  Loss: {train_loss:.4f} / {val_loss:.4f}  |  "
+                  f"Acc: {train_acc:.2%} / {val_acc:.2%}  |  LR: {lr_now:.6f}")
 
-    plot_curves(history, os.path.join(args.checkpoint_dir, "training_curves.png"))
+            # Log epoch metrics to MLflow
+            log_epoch_metrics(epoch, train_loss, val_loss, train_acc, val_acc, lr_now)
 
-    with open(os.path.join(args.checkpoint_dir, "history.json"), "w") as f:
-        json.dump(history, f, indent=2)
+            # ── Checkpoint best model ────────────────────────────────────────
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                ckpt_path = os.path.join(args.checkpoint_dir, "best_model.pth")
+                torch.save({
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "val_loss": val_loss,
+                    "val_acc": val_acc,
+                    "class_names": CLASS_NAMES,
+                }, ckpt_path)
+                print(f"  ✓ Saved best model (val_loss={val_loss:.4f})")
+            else:
+                patience_counter += 1
+                if patience_counter >= args.patience:
+                    print(f"\n  ⏹ Early stopping triggered (patience={args.patience})")
+                    break
 
-    print(f"\n{'='*60}")
-    print(f"  Training complete!  Best val loss: {best_val_loss:.4f}")
-    print(f"  Checkpoint: {os.path.join(args.checkpoint_dir, 'best_model.pth')}")
-    print(f"{'='*60}\n")
+            print()
+
+        # ── Save curves & history ────────────────────────────────────────────
+
+        plot_curves(history, os.path.join(args.checkpoint_dir, "training_curves.png"))
+
+        with open(os.path.join(args.checkpoint_dir, "history.json"), "w") as f:
+            json.dump(history, f, indent=2)
+
+        # ── Log final metrics & artifacts to MLflow ──────────────────────────
+
+        mlflow.log_metrics({
+            "best_val_loss": best_val_loss,
+            "best_val_acc": max(history["val_acc"]) if history["val_acc"] else 0.0,
+            "final_train_loss": history["train_loss"][-1] if history["train_loss"] else 0.0,
+            "final_train_acc": history["train_acc"][-1] if history["train_acc"] else 0.0,
+            "epochs_completed": len(history["train_loss"]),
+        })
+
+        log_training_artifacts(args.checkpoint_dir)
+
+        print(f"\n{'='*60}")
+        print(f"  Training complete!  Best val loss: {best_val_loss:.4f}")
+        print(f"  Checkpoint: {os.path.join(args.checkpoint_dir, 'best_model.pth')}")
+        print(f"  MLflow run: {run.info.run_id}")
+        print(f"{'='*60}\n")
 
 
 # ── Helper: apply transforms to a Subset ─────────────────────────────────────

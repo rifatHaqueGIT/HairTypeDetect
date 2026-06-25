@@ -17,6 +17,17 @@ data/
 checkpoints/
 screenshots/
 
+# ── MLflow ───────────────────────────────────
+mlruns/
+
+# ── Contributions (user submissions) ────────
+contributions/pending/
+contributions/rejected/
+
+# ── Secrets & sync state ────────────────────
+.env
+.databricks_sync.json
+
 # ── IDE / OS ─────────────────────────────────
 .vscode/
 .idea/
@@ -32,3 +43,4 @@ Thumbs.db
 # ── Misc ─────────────────────────────────────
 artifacts/
 *.log
+
